@@ -72,6 +72,21 @@ def format_bytes(data: bytes, mode: str) -> str:
     return " ".join(f"{b:02X}" for b in data)
 
 
+def bytes_to_ascii_text(data: bytes, strip_newlines: bool = False) -> str:
+    chars = []
+    for b in data:
+        if 32 <= b <= 126:
+            chars.append(chr(b))
+        elif b == 9:
+            chars.append("\t")
+        elif b in (10, 13):
+            if not strip_newlines:
+                chars.append("\n" if b == 10 else "\r")
+        else:
+            chars.append(".")
+    return "".join(chars)
+
+
 # -----------------------------
 # Settings dialog
 # -----------------------------
@@ -139,6 +154,7 @@ class SettingsDialog(tk.Toplevel):
         view.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         ttk.Radiobutton(view, text="HEX", value="HEX", variable=self.view_mode_var).grid(row=0, column=0, padx=6, sticky="w")
         ttk.Radiobutton(view, text="DEC", value="DEC", variable=self.view_mode_var).grid(row=0, column=1, padx=6, sticky="w")
+        ttk.Radiobutton(view, text="ASCII", value="ASCII", variable=self.view_mode_var).grid(row=0, column=2, padx=6, sticky="w")
 
         btns = ttk.Frame(frm)
         btns.grid(row=8, column=0, columnspan=3, sticky="e", pady=(12, 0))
@@ -246,47 +262,60 @@ class SerialWorker(threading.Thread):
             return
 
         rx_buf = bytearray()
+        ascii_buf = bytearray()
         last_auto_tx = 0.0
 
         try:
             while not self.stop_event.is_set():
-                # 1) RX: assemble UMB telegrams using LEN field (byte 6)
-                # NOTE: Do NOT split on 0x04 blindly; 0x04 can appear in payload (e.g., channel count).
+                s = self.settings_getter()
+                ascii_mode = (s.get("view_mode") == "ASCII")
+
+                # 1) RX
                 try:
                     chunk = self.ser.read(512)
                     if chunk:
-                        rx_buf.extend(chunk)
+                        if ascii_mode:
+                            ascii_buf.extend(chunk)
+                            while True:
+                                nl_idx = next((i for i, b in enumerate(ascii_buf) if b in (10, 13)), -1)
+                                if nl_idx < 0:
+                                    break
+                                line = bytes(ascii_buf[:nl_idx])
+                                cut = nl_idx
+                                while cut < len(ascii_buf) and ascii_buf[cut] in (10, 13):
+                                    cut += 1
+                                del ascii_buf[:cut]
+                                if line:
+                                    self.ui_queue.put(("rx_ascii", line))
+                        else:
+                            rx_buf.extend(chunk)
 
-                        while True:
-                            # resync to SOH
-                            try:
-                                soh_idx = rx_buf.index(SOH)
-                            except ValueError:
-                                rx_buf.clear()
-                                break
-                            if soh_idx > 0:
-                                del rx_buf[:soh_idx]
+                            while True:
+                                try:
+                                    soh_idx = rx_buf.index(SOH)
+                                except ValueError:
+                                    rx_buf.clear()
+                                    break
+                                if soh_idx > 0:
+                                    del rx_buf[:soh_idx]
 
-                            # Need at least header+CRC+EOT
-                            if len(rx_buf) < 12:
-                                break
+                                if len(rx_buf) < 12:
+                                    break
 
-                            payload_len = rx_buf[6]  # bytes between STX and ETX (exclusive)
-                            total_len = 12 + payload_len  # 7 hdr + STX + payload + ETX + CRC16(2) + EOT
-                            if len(rx_buf) < total_len:
-                                break
+                                payload_len = rx_buf[6]
+                                total_len = 12 + payload_len
+                                if len(rx_buf) < total_len:
+                                    break
 
-                            frame = bytes(rx_buf[:total_len])
-                            del rx_buf[:total_len]
+                                frame = bytes(rx_buf[:total_len])
+                                del rx_buf[:total_len]
 
-                            # Basic validation; if invalid, push back tail and keep scanning
-                            etx_idx = 8 + payload_len
-                            if not (frame[0] == SOH and frame[7] == STX and etx_idx < len(frame) and frame[etx_idx] == ETX and frame[-1] == EOT):
-                                # Put back everything except the first byte to find next SOH
-                                rx_buf[:0] = frame[1:]
-                                continue
+                                etx_idx = 8 + payload_len
+                                if not (frame[0] == SOH and frame[7] == STX and etx_idx < len(frame) and frame[etx_idx] == ETX and frame[-1] == EOT):
+                                    rx_buf[:0] = frame[1:]
+                                    continue
 
-                            self.ui_queue.put(("rx_frame", frame))
+                                self.ui_queue.put(("rx_frame", frame))
                 except Exception as e:
                     self.ui_queue.put(("error", f"RX error: {e}"))
                     break
@@ -305,10 +334,9 @@ class SerialWorker(threading.Thread):
                     self.ui_queue.put(("error", f"TX error: {e}"))
                     break
 
-                # 3) Auto TX: interval + repeat
-                s = self.settings_getter()
+                # 3) Auto TX: interval + repeat (disabled in ASCII mode)
                 now = time.time()
-                if (now - last_auto_tx) >= float(s["tx_interval"]):
+                if (not ascii_mode) and (now - last_auto_tx) >= float(s["tx_interval"]):
                     last_auto_tx = now
                     b = self.auto_tx_getter()
                     if b:
@@ -402,6 +430,7 @@ class App(tk.Tk):
             v.trace_add("write", lambda *args: self._schedule_save_config())
 
         self._build_ui()
+        self._apply_view_mode_ui()
         self.after(60, self._drain_ui_queue)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -481,7 +510,7 @@ class App(tk.Tk):
         self.lbl_status.pack(side="left", padx=12)
 
         ttk.Label(bar, text="View").pack(side="right")
-        self.view_combo = ttk.Combobox(bar, width=6, values=["HEX", "DEC"])
+        self.view_combo = ttk.Combobox(bar, width=8, values=["HEX", "DEC", "ASCII"], state="readonly")
         self.view_combo.set(self.settings["view_mode"])
         self.view_combo.bind("<<ComboboxSelected>>", lambda e: self._set_view_mode(self.view_combo.get()))
         self.view_combo.pack(side="right", padx=6)
@@ -494,7 +523,7 @@ class App(tk.Tk):
         self.lbl_save = ttk.Label(savebar, text="(no file)")
         self.lbl_save.pack(side="left", padx=8)
 
-                # Terminal (split view: RAW on top, Human-readable on bottom)
+        # Terminal (split view: RAW on top, Human-readable on bottom / ASCII input)
         term_frame = ttk.Frame(self, padding=6)
         term_frame.pack(fill="both", expand=True)
 
@@ -510,7 +539,7 @@ class App(tk.Tk):
         raw_ys.pack(side="right", fill="y")
         self.term_raw.configure(yscrollcommand=raw_ys.set)
 
-        # --- Human-readable (bottom) ---
+        # --- Human-readable (bottom) / ASCII TX input ---
         human_frame = ttk.Frame(paned)
         self.term_human = tk.Text(human_frame, wrap="none", height=6)
         self.term_human.pack(side="left", fill="both", expand=True)
@@ -518,6 +547,8 @@ class App(tk.Tk):
         human_ys = ttk.Scrollbar(human_frame, orient="vertical", command=self.term_human.yview)
         human_ys.pack(side="right", fill="y")
         self.term_human.configure(yscrollcommand=human_ys.set)
+        self.term_human.bind("<Return>", self._on_ascii_return, add="+")
+        self.term_human.bind("<Shift-Return>", self._on_ascii_shift_return, add="+")
 
         paned.add(raw_frame, weight=1)
         paned.add(human_frame, weight=1)
@@ -526,24 +557,35 @@ class App(tk.Tk):
         bottom = ttk.Frame(self, padding=6)
         bottom.pack(fill="x")
 
-        ttk.Label(bottom, text="TX Mode").grid(row=0, column=0, sticky="w")
-        ttk.Combobox(bottom, textvariable=self.tx_mode, width=10, values=["UMB_2F", "CUSTOM"]).grid(row=0, column=1, padx=6, sticky="w")
+        self.lbl_tx_mode = ttk.Label(bottom, text="TX Mode")
+        self.lbl_tx_mode.grid(row=0, column=0, sticky="w")
+        self.cmb_tx_mode = ttk.Combobox(bottom, textvariable=self.tx_mode, width=10, values=["UMB_2F", "CUSTOM"], state="readonly")
+        self.cmb_tx_mode.grid(row=0, column=1, padx=6, sticky="w")
 
-        ttk.Label(bottom, text="WS class").grid(row=0, column=2, sticky="w")
-        ttk.Entry(bottom, textvariable=self.class_id, width=6).grid(row=0, column=3, padx=6, sticky="w")
+        self.lbl_ws_class = ttk.Label(bottom, text="WS class")
+        self.lbl_ws_class.grid(row=0, column=2, sticky="w")
+        self.ent_class_id = ttk.Entry(bottom, textvariable=self.class_id, width=6)
+        self.ent_class_id.grid(row=0, column=3, padx=6, sticky="w")
 
-        ttk.Label(bottom, text="device_id").grid(row=0, column=4, sticky="w")
-        ttk.Entry(bottom, textvariable=self.device_id, width=6).grid(row=0, column=5, padx=6, sticky="w")
+        self.lbl_device_id = ttk.Label(bottom, text="device_id")
+        self.lbl_device_id.grid(row=0, column=4, sticky="w")
+        self.ent_device_id = ttk.Entry(bottom, textvariable=self.device_id, width=6)
+        self.ent_device_id.grid(row=0, column=5, padx=6, sticky="w")
 
-        ttk.Label(bottom, text="channels").grid(row=0, column=6, sticky="w")
-        ttk.Entry(bottom, textvariable=self.channels_var, width=40).grid(row=0, column=7, padx=6, sticky="w")
+        self.lbl_channels = ttk.Label(bottom, text="channels")
+        self.lbl_channels.grid(row=0, column=6, sticky="w")
+        self.ent_channels = ttk.Entry(bottom, textvariable=self.channels_var, width=40)
+        self.ent_channels.grid(row=0, column=7, padx=6, sticky="w")
 
-        ttk.Button(bottom, text="Send Once", command=self.send_once).grid(row=0, column=8, padx=8)
-        btn_clear = ttk.Button(bottom, text="Clear", command=self._clear_terminal_views)
-        btn_clear.grid(row=0, column=9, padx=8)
+        self.btn_send_once = ttk.Button(bottom, text="Send Once", command=self.send_once)
+        self.btn_send_once.grid(row=0, column=8, padx=8)
+        self.btn_clear = ttk.Button(bottom, text="Clear", command=self._clear_terminal_views)
+        self.btn_clear.grid(row=0, column=9, padx=8)
 
-        ttk.Label(bottom, text="Custom TX (hex)").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(bottom, textvariable=self.custom_tx_hex, width=110).grid(row=1, column=1, columnspan=9, padx=6, sticky="w", pady=(6, 0))
+        self.lbl_custom_tx = ttk.Label(bottom, text="Custom TX (hex)")
+        self.lbl_custom_tx.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.ent_custom_tx = ttk.Entry(bottom, textvariable=self.custom_tx_hex, width=110)
+        self.ent_custom_tx.grid(row=1, column=1, columnspan=9, padx=6, sticky="w", pady=(6, 0))
 
     # ---- Save TXT ----
     def _select_txt(self):
@@ -579,9 +621,46 @@ class App(tk.Tk):
             self._log_line("SAVE OFF")
 
     # ---- UI helpers ----
+    def _is_ascii_mode(self) -> bool:
+        return self.settings.get("view_mode") == "ASCII"
+
+    def _set_widget_enabled(self, widget, enabled: bool):
+        state = "normal" if enabled else "disabled"
+        try:
+            widget.configure(state=state)
+        except Exception:
+            try:
+                if enabled:
+                    widget.state(["!disabled"])
+                else:
+                    widget.state(["disabled"])
+            except Exception:
+                pass
+
+    def _apply_view_mode_ui(self):
+        ascii_mode = self._is_ascii_mode()
+
+        for widget in (
+            getattr(self, "cmb_tx_mode", None),
+            getattr(self, "ent_class_id", None),
+            getattr(self, "ent_device_id", None),
+            getattr(self, "ent_channels", None),
+            getattr(self, "btn_send_once", None),
+            getattr(self, "ent_custom_tx", None),
+        ):
+            if widget is not None:
+                self._set_widget_enabled(widget, not ascii_mode)
+
+        if hasattr(self, "term_human"):
+            self.term_human.delete("1.0", "end")
+            self.term_human.configure(wrap="word" if ascii_mode else "none")
+            if ascii_mode:
+                self.term_human.focus_set()
+
     def _set_view_mode(self, mode: str):
-        if mode in ("HEX", "DEC"):
+        if mode in ("HEX", "DEC", "ASCII"):
             self.settings["view_mode"] = mode
+            self._apply_view_mode_ui()
             self._schedule_save_config()
 
     def _clear_terminal_views(self):
@@ -591,14 +670,31 @@ class App(tk.Tk):
             self.term_human.delete("1.0", "end")
 
     def _log_line(self, line: str):
-        # General info/status messages (kept in RAW view with timestamp)
         ts = time.strftime("%H:%M:%S")
         out = f"[{ts}] {line}"
         self.term_raw.insert("end", out + "\n")
         self.term_raw.see("end")
 
+    def _append_ascii_log(self, direction: str, payload):
+        if isinstance(payload, bytes):
+            text = bytes_to_ascii_text(payload, strip_newlines=True)
+        else:
+            text = str(payload).replace("\r", "").replace("\n", "")
+
+        ts = time.strftime("%H:%M:%S")
+        line = f"[{ts}] {direction}: {text}"
+        self.term_raw.insert("end", line + "\n")
+        self.term_raw.see("end")
+
+        if self.save_enabled.get() and self.save_fp:
+            self.save_fp.write(line + "\n")
+            self.save_fp.flush()
+
     def _append_raw_frame(self, direction: str, data: bytes):
-        # RAW UMB bytes (timestamped in UI only)
+        if self._is_ascii_mode():
+            self._append_ascii_log(direction, data)
+            return
+
         s = format_bytes(data, self.settings["view_mode"])
         tokens = s.split()
         ts = time.strftime("%H:%M:%S")
@@ -614,6 +710,35 @@ class App(tk.Tk):
             mid = (len(tokens) + 1) // 2
             emit(tokens[:mid])
             emit(tokens[mid:])
+
+    def _send_ascii_input(self) -> bool:
+        if not self._is_ascii_mode():
+            return False
+        if not (self.worker and self.worker.is_alive()):
+            messagebox.showwarning("Send", "먼저 Connect 해 주세요.")
+            return False
+
+        text = self.term_human.get("1.0", "end-1c")
+        text = text.replace("\r", "").replace("\n", "")
+        if not text:
+            return False
+
+        self.tx_q.put(text.encode("ascii", errors="replace") + b"\r\n")
+        self.term_human.delete("1.0", "end")
+        self.term_human.focus_set()
+        return True
+
+    def _on_ascii_return(self, event=None):
+        if self._is_ascii_mode():
+            self._send_ascii_input()
+            return "break"
+        return None
+
+    def _on_ascii_shift_return(self, event=None):
+        if self._is_ascii_mode():
+            return "break"
+        return None
+
 
     def _extract_umb_values(self, frame: bytes) -> dict:
         # Extract float32(0x16) values from CMD_2F responses.
@@ -700,6 +825,7 @@ class App(tk.Tk):
         if dlg.result:
             self.settings.update(dlg.result)
             self.view_combo.set(self.settings["view_mode"])
+            self._apply_view_mode_ui()
             self._log_line("Settings updated.")
             self._save_config()
 
@@ -762,6 +888,8 @@ class App(tk.Tk):
         return build_umb_frame(to_addr, from_addr, CMD_2F, VERC_1_0, payload)
 
     def _get_auto_tx_bytes(self) -> bytes | None:
+        if self._is_ascii_mode():
+            return None
         mode = self.tx_mode.get()
         if mode == "CUSTOM":
             b = parse_hex_string_to_bytes(self.custom_tx_hex.get())
@@ -795,11 +923,12 @@ class App(tk.Tk):
                     self.disconnect()
 
                 elif kind == "tx":
-                    # RAW bytes on top
                     self._append_raw_frame("TX", payload)
 
+                elif kind == "rx_ascii":
+                    self._append_ascii_log("RX", payload)
+
                 elif kind == "rx_frame":
-                    # Apply offsets (dev) then show RAW + Human-readable
                     self._append_raw_frame("RX", payload)
                     self._append_human_from_frame(payload)
 
